@@ -1837,12 +1837,18 @@ function App() {
               <div className="section-heading">{t("securityConfig")}</div>
               <div className="security-fields">
                 <div className="gw-field">
-                  <label className="field-label">{t("adminToken")}</label>
+                  <label className="field-label">
+                    {t("adminToken")}
+                    <span className="field-label-hint"> ({t("authHeaderHint")})</span>
+                  </label>
                   <input className="form-input" type="password" placeholder={t("tokenPlaceholder")}
                     value={adminToken} onChange={(e) => setAdminToken(e.target.value)} />
                 </div>
                 <div className="gw-field">
-                  <label className="field-label">{t("mcpToken")}</label>
+                  <label className="field-label">
+                    {t("mcpToken")}
+                    <span className="field-label-hint"> ({t("authHeaderHint")})</span>
+                  </label>
                   <input className="form-input" type="password" placeholder={t("tokenPlaceholder")}
                     value={mcpToken} onChange={(e) => setMcpToken(e.target.value)} />
                 </div>

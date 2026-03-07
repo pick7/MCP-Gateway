@@ -848,6 +848,14 @@ html, body {
   letter-spacing: 0.5px;
 }
 
+.field-label-hint {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
 .json-hint {
   font-size: 11px;
   color: var(--text-muted);

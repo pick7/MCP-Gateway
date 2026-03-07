@@ -26,6 +26,7 @@ const translations = {
     securityConfig: "安全配置",
     adminToken: "Admin Token",
     mcpToken: "MCP Token",
+    authHeaderHint: "请求头：Authorization",
     tokenPlaceholder: "留空则禁用",
 
     // Skills
@@ -194,6 +195,7 @@ const translations = {
     securityConfig: "Security",
     adminToken: "Admin Token",
     mcpToken: "MCP Token",
+    authHeaderHint: "Header: Authorization",
     tokenPlaceholder: "Leave empty to disable",
 
     // Skills
