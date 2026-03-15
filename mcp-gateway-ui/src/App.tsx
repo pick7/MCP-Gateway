@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Play,
   Square,
@@ -248,6 +248,14 @@ interface EditableConfigSnapshot {
 }
 
 type EndpointTransportType = "sse" | "streamable-http";
+type ServerDropPosition = "before" | "after";
+
+interface ServerDragTarget {
+  index: number;
+  position: ServerDropPosition;
+}
+
+const SERVER_LIST_GAP_PX = 16;
 
 // 版本号由 Vite 在编译时注入（CI 时来自 git tag，本地开发时来自 package.json）
 const CURRENT_VERSION = import.meta.env.VITE_APP_VERSION as string;
@@ -323,12 +331,62 @@ function createEditableConfigFingerprint(snapshot: EditableConfigSnapshot): stri
   return JSON.stringify(stableSortValue(snapshot));
 }
 
-function createMcpClientEntryJson(name: string, type: EndpointTransportType, url: string): string {
+function buildServersJson(servers: ServerConfig[]): string {
+  return JSON.stringify(serversToJson(servers), null, 2);
+}
+
+function moveArrayItem<T>(
+  items: T[],
+  sourceIndex: number,
+  targetIndex: number,
+  position: ServerDropPosition,
+): T[] {
+  if (sourceIndex === targetIndex) {
+    return items;
+  }
+
+  const next = [...items];
+  const [movedItem] = next.splice(sourceIndex, 1);
+  let insertIndex = targetIndex;
+
+  if (sourceIndex < targetIndex) {
+    insertIndex -= 1;
+  }
+  if (position === "after") {
+    insertIndex += 1;
+  }
+
+  insertIndex = Math.max(0, Math.min(insertIndex, next.length));
+  next.splice(insertIndex, 0, movedItem);
+  return next;
+}
+
+function stripIndexKeyedEntries<T>(entries: Record<string, T>): Record<string, T> {
+  return Object.fromEntries(
+    Object.entries(entries).filter(([key]) => !key.startsWith("idx:")),
+  ) as Record<string, T>;
+}
+
+function createMcpClientEntryJson(
+  name: string,
+  type: EndpointTransportType,
+  url: string,
+  authorizationToken?: string,
+): string {
+  const trimmedToken = authorizationToken?.trim() ?? "";
+  const entry: Record<string, unknown> = {
+    type,
+    url,
+  };
+
+  if (trimmedToken) {
+    entry.headers = {
+      Authorization: `Bearer ${trimmedToken}`,
+    };
+  }
+
   return JSON.stringify({
-    [name]: {
-      type,
-      url,
-    },
+    [name]: entry,
   }, null, 2)
     .split("\n")
     .slice(1, -1)
@@ -961,6 +1019,11 @@ function App() {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [savedConfigFingerprint, setSavedConfigFingerprint] = useState("");
   const [configPath, setConfigPath] = useState<string>("");
+  const [serverUiIds, setServerUiIds] = useState<string[]>([]);
+  const [draggedServerIndex, setDraggedServerIndex] = useState<number | null>(null);
+  const [serverDropTarget, setServerDropTarget] = useState<ServerDragTarget | null>(null);
+  const [draggedServerOffsetY, setDraggedServerOffsetY] = useState(0);
+  const [draggedServerHeight, setDraggedServerHeight] = useState(0);
   // 删除确认弹窗状态
   const [deleteConfirm, setDeleteConfirm] = useState<{ open: boolean; index: number; name: string }>({
     open: false, index: -1, name: ""
@@ -975,10 +1038,38 @@ function App() {
   const knownPendingIdsRef = useRef<Set<string>>(new Set());
   const dismissedPopupIdsRef = useRef<Set<string>>(new Set());
   const pendingFetchSeqRef = useRef(0);
+  const serverUiIdSeqRef = useRef(0);
+  const dragPointerIdRef = useRef<number | null>(null);
+  const dragStartClientYRef = useRef(0);
+  const dragFrameRef = useRef<number | null>(null);
+  const latestPointerClientYRef = useRef<number | null>(null);
+  const serverBlockRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const serverDropTargetRef = useRef<ServerDragTarget | null>(null);
   const apiClient = useMemo(
     () => new ApiClient(listen, adminToken, apiPrefix),
     [adminToken, apiPrefix, listen],
   );
+  const createServerUiId = useCallback(() => `server-ui-${serverUiIdSeqRef.current++}`, []);
+  const createServerUiIds = useCallback(
+    (count: number) => Array.from({ length: count }, () => createServerUiId()),
+    [createServerUiId],
+  );
+  const draggedServerUiId = draggedServerIndex === null ? null : (serverUiIds[draggedServerIndex] ?? null);
+  const previewServerUiIds = useMemo(() => {
+    if (draggedServerIndex === null || !serverDropTarget) {
+      return serverUiIds;
+    }
+    return moveArrayItem(serverUiIds, draggedServerIndex, serverDropTarget.index, serverDropTarget.position);
+  }, [draggedServerIndex, serverDropTarget, serverUiIds]);
+  const previewDraggedServerIndex = useMemo(() => {
+    if (!draggedServerUiId) {
+      return -1;
+    }
+    return previewServerUiIds.indexOf(draggedServerUiId);
+  }, [draggedServerUiId, previewServerUiIds]);
+  const serverShiftDistance = draggedServerHeight > 0
+    ? draggedServerHeight + SERVER_LIST_GAP_PX
+    : 0;
 
   const syncSkillRootsToConfig = useCallback((nextItems: SkillDirectoryItem[]) => {
     const normalizedEntries = nextItems
@@ -1083,6 +1174,7 @@ function App() {
       const nextMcpToken = cfg.security?.mcp?.token ?? "";
 
       setServers(nextServers);
+      setServerUiIds(createServerUiIds(nextServers.length));
       setServerTestStates({});
       setServerAuthStates({});
       setAutoTestingServers(false);
@@ -1118,7 +1210,7 @@ function App() {
       });
       setSkillsRulesDraft(JSON.stringify(nextSkills.policy.rules, null, 2));
       setSkillsRulesError(null);
-      setJsonText(JSON.stringify(serversToJson(nextServers), null, 2));
+      setJsonText(buildServersJson(nextServers));
       setSavedConfigFingerprint(createEditableConfigFingerprint(createEditableConfigSnapshot({
         servers: nextServers,
         listen: nextListen,
@@ -1133,7 +1225,7 @@ function App() {
     }).catch((e) => setError(String(e)));
     // 获取配置文件路径
     getConfigPath().then(setConfigPath).catch(() => {});
-  }, [runItemValidation]);
+  }, [createServerUiIds, runItemValidation]);
 
   const parsedJsonServers = useMemo(() => {
     if (serversMode !== "json") {
@@ -1147,7 +1239,7 @@ function App() {
   }, [jsonText, serversMode]);
 
   const switchToJson = () => {
-    setJsonText(JSON.stringify(serversToJson(servers), null, 2));
+    setJsonText(buildServersJson(servers));
     setJsonError(null);
     setServersMode("json");
   };
@@ -1157,8 +1249,11 @@ function App() {
       return;
     }
     setServers(parsedJsonServers);
+    setServerUiIds(createServerUiIds(parsedJsonServers.length));
     setServerTestStates({});
     setServerAuthStates({});
+    setDraggedServerIndex(null);
+    setServerDropTarget(null);
     setJsonError(null);
     setServersMode("visual");
   };
@@ -1693,17 +1788,185 @@ function App() {
     setServerTestStates({});
     setServerAuthStates({});
     setDeleteConfirm({ open: false, index: -1, name: "" });
+    setServerUiIds((prev) => prev.filter((_, xi) => xi !== deleteConfirm.index));
+    setJsonText(buildServersJson(servers.filter((_, xi) => xi !== deleteConfirm.index)));
   };
   const cancelDelete = () => {
     setDeleteConfirm({ open: false, index: -1, name: "" });
   };
+
+  const resetServerDragState = useCallback(() => {
+    if (dragFrameRef.current !== null) {
+      window.cancelAnimationFrame(dragFrameRef.current);
+      dragFrameRef.current = null;
+    }
+    dragPointerIdRef.current = null;
+    dragStartClientYRef.current = 0;
+    latestPointerClientYRef.current = null;
+    serverDropTargetRef.current = null;
+    setDraggedServerIndex(null);
+    setServerDropTarget(null);
+    setDraggedServerOffsetY(0);
+    setDraggedServerHeight(0);
+  }, []);
+
+  const updateServerDropTarget = useCallback((nextTarget: ServerDragTarget | null) => {
+    serverDropTargetRef.current = nextTarget;
+    setServerDropTarget((current) =>
+      current?.index === nextTarget?.index && current?.position === nextTarget?.position
+        ? current
+        : nextTarget,
+    );
+  }, []);
+
+  const findServerDropTarget = useCallback((clientY: number, sourceIndex: number): ServerDragTarget | null => {
+    const blocks = serverUiIds
+      .map((id, index) => ({
+        index,
+        node: serverBlockRefs.current[id] ?? null,
+      }))
+      .filter((entry) => entry.index !== sourceIndex)
+      .filter((entry): entry is { index: number; node: HTMLDivElement } => entry.node !== null);
+
+    for (const block of blocks) {
+      const rect = block.node.getBoundingClientRect();
+      const midpoint = rect.top + rect.height / 2;
+      if (clientY < midpoint) {
+        return block.index === sourceIndex ? null : { index: block.index, position: "before" };
+      }
+    }
+
+    const lastBlock = blocks.length > 0 ? blocks[blocks.length - 1] : null;
+    if (!lastBlock || lastBlock.index === sourceIndex) {
+      return null;
+    }
+    return { index: lastBlock.index, position: "after" };
+  }, [serverUiIds]);
+
+  const handleServerPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>, index: number) => {
+    if (event.button !== 0 || servers.length <= 1) {
+      return;
+    }
+
+    event.preventDefault();
+    const targetId = serverUiIds[index] ?? `server-${index}`;
+    const blockRect = serverBlockRefs.current[targetId]?.getBoundingClientRect();
+    dragPointerIdRef.current = event.pointerId;
+    dragStartClientYRef.current = event.clientY;
+    latestPointerClientYRef.current = event.clientY;
+    setDraggedServerOffsetY(0);
+    setDraggedServerHeight(blockRect?.height ?? 0);
+    setDraggedServerIndex(index);
+    window.getSelection()?.removeAllRanges();
+    updateServerDropTarget(null);
+  }, [serverUiIds, servers.length, updateServerDropTarget]);
+
+  const updateDraggedServerPreview = useCallback((clientY: number, sourceIndex: number) => {
+    setDraggedServerOffsetY(clientY - dragStartClientYRef.current);
+    updateServerDropTarget(findServerDropTarget(clientY, sourceIndex));
+  }, [findServerDropTarget, updateServerDropTarget]);
+
+  const getServerBlockStyle = useCallback((index: number) => {
+    if (draggedServerIndex === null) {
+      return undefined;
+    }
+
+    if (index === draggedServerIndex) {
+      return {
+        transform: `translateY(${Math.round(draggedServerOffsetY)}px)`,
+        transition: "none",
+        zIndex: 4,
+        pointerEvents: "none" as const,
+      };
+    }
+
+    let translateY = 0;
+    if (previewDraggedServerIndex > draggedServerIndex && index > draggedServerIndex && index <= previewDraggedServerIndex) {
+      translateY = -serverShiftDistance;
+    } else if (previewDraggedServerIndex >= 0 && previewDraggedServerIndex < draggedServerIndex && index >= previewDraggedServerIndex && index < draggedServerIndex) {
+      translateY = serverShiftDistance;
+    }
+
+    return {
+      transform: translateY === 0 ? undefined : `translateY(${Math.round(translateY)}px)`,
+      transition: "transform 220ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 180ms ease, border-color 180ms ease, opacity 180ms ease",
+      zIndex: 1,
+    };
+  }, [draggedServerIndex, draggedServerOffsetY, previewDraggedServerIndex, serverShiftDistance]);
+
+  useEffect(() => {
+    if (draggedServerIndex === null) {
+      return;
+    }
+
+    const previousUserSelect = document.body.style.userSelect;
+    const previousCursor = document.body.style.cursor;
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "grabbing";
+
+    const finishPointerDrag = (clientY: number) => {
+      if (dragFrameRef.current !== null) {
+        window.cancelAnimationFrame(dragFrameRef.current);
+        dragFrameRef.current = null;
+      }
+      updateDraggedServerPreview(clientY, draggedServerIndex);
+      const target = findServerDropTarget(clientY, draggedServerIndex) ?? serverDropTargetRef.current;
+      if (target) {
+        const nextServers = moveArrayItem(servers, draggedServerIndex, target.index, target.position);
+        const nextServerUiIds = moveArrayItem(serverUiIds, draggedServerIndex, target.index, target.position);
+        setServers(nextServers);
+        setServerUiIds(nextServerUiIds);
+        setJsonText(buildServersJson(nextServers));
+        setServerTestStates((prev) => stripIndexKeyedEntries(prev));
+        setServerAuthStates((prev) => stripIndexKeyedEntries(prev));
+      }
+      resetServerDragState();
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (dragPointerIdRef.current !== null && event.pointerId !== dragPointerIdRef.current) {
+        return;
+      }
+      latestPointerClientYRef.current = event.clientY;
+      if (dragFrameRef.current !== null) {
+        return;
+      }
+      dragFrameRef.current = window.requestAnimationFrame(() => {
+        dragFrameRef.current = null;
+        const pointerY = latestPointerClientYRef.current;
+        if (pointerY === null) {
+          return;
+        }
+        updateDraggedServerPreview(pointerY, draggedServerIndex);
+      });
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      if (dragPointerIdRef.current !== null && event.pointerId !== dragPointerIdRef.current) {
+        return;
+      }
+      finishPointerDrag(event.clientY);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+      document.body.style.userSelect = previousUserSelect;
+      document.body.style.cursor = previousCursor;
+    };
+  }, [draggedServerIndex, findServerDropTarget, resetServerDragState, serverUiIds, servers, updateDraggedServerPreview]);
 
   const baseUrl = listen.startsWith("http") ? listen : `http://${listen}`;
   const skillHttpUrl = `${baseUrl}${httpPath}/${skills.serverName}`;
   const skillSseUrl = `${baseUrl}${ssePath}/${skills.serverName}`;
 
   const handleCopy = async (name: string, type: EndpointTransportType, url: string, key: string) => {
-    const snippet = createMcpClientEntryJson(name, type, url);
+    const snippet = createMcpClientEntryJson(name, type, url, mcpToken);
     await navigator.clipboard.writeText(snippet);
     setCopied(key);
     setTimeout(() => setCopied(null), 2000);
@@ -1869,7 +2132,7 @@ function App() {
                 <div className="gw-field">
                   <label className="field-label">
                     {t("adminToken")}
-                    <span className="field-label-hint"> ({t("authHeaderHint")})</span>
+                    <span className="field-label-hint"> ({t("authHeaderHint")}，{t("adminTokenUsageHint")})</span>
                   </label>
                   <input className="form-input" type="password" placeholder={t("tokenPlaceholder")}
                     value={adminToken} onChange={(e) => setAdminToken(e.target.value)} />
@@ -1877,7 +2140,7 @@ function App() {
                 <div className="gw-field">
                   <label className="field-label">
                     {t("mcpToken")}
-                    <span className="field-label-hint"> ({t("authHeaderHint")})</span>
+                    <span className="field-label-hint"> ({t("authHeaderHint")}，{t("mcpTokenUsageHint")})</span>
                   </label>
                   <input className="form-input" type="password" placeholder={t("tokenPlaceholder")}
                     value={mcpToken} onChange={(e) => setMcpToken(e.target.value)} />
@@ -1917,8 +2180,25 @@ function App() {
                   ) : (
                     <div className="servers-list">
                       {servers.map((s, i) => (
-                        <div className="server-block" key={i}>
-                          <div className="server-row-header">
+                        <div
+                          className={[
+                            "server-block",
+                            draggedServerIndex === i ? "server-block-dragging" : "",
+                            serverDropTarget?.index === i ? `server-block-drop-${serverDropTarget.position}` : "",
+                          ].filter(Boolean).join(" ")}
+                          key={serverUiIds[i] ?? `server-${i}`}
+                          style={getServerBlockStyle(i)}
+                          ref={(node) => {
+                            const key = serverUiIds[i] ?? `server-${i}`;
+                            serverBlockRefs.current[key] = node;
+                          }}
+                        >
+                          <div
+                            className={`server-row-header ${servers.length > 1 ? "server-row-header-draggable" : ""}`}
+                            onPointerDown={(event) => handleServerPointerDown(event, i)}
+                            title={servers.length > 1 ? t("dragServerReorder") : undefined}
+                            aria-grabbed={draggedServerIndex === i}
+                          >
                             <span className="col-toggle" />
                             <span>{t("name")}</span>
                             <span>{t("command")}</span>
@@ -1965,6 +2245,7 @@ function App() {
                         name: "", command: "npx", args: ["-y", ""],
                         description: "", cwd: "", env: {}, lifecycle: null, stdioProtocol: "auto", enabled: true,
                       }]);
+                      setServerUiIds((prev) => [...prev, createServerUiId()]);
                       setServerTestStates({});
                       setServerAuthStates({});
                     }}>

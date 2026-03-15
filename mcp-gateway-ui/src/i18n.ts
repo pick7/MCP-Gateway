@@ -27,6 +27,8 @@ const translations = {
     adminToken: "Admin Token",
     mcpToken: "MCP Token",
     authHeaderHint: "请求头：Authorization",
+    adminTokenUsageHint: "用于管理配置",
+    mcpTokenUsageHint: "用于远程 MCP 服务验证",
     tokenPlaceholder: "留空则禁用",
 
     // Skills
@@ -120,6 +122,7 @@ const translations = {
     // 端点链接
     copySSE: "复制 SSE JSON",
     copyHTTP: "复制 HTTP JSON",
+    dragServerReorder: "拖动此标题可调整服务顺序",
     noEnabledServers: "无启用服务 — 请添加服务后重启",
     endpointSSE: "SSE",
     endpointHTTP: "HTTP",
@@ -202,6 +205,8 @@ const translations = {
     adminToken: "Admin Token",
     mcpToken: "MCP Token",
     authHeaderHint: "Header: Authorization",
+    adminTokenUsageHint: "for admin/config management",
+    mcpTokenUsageHint: "for remote MCP service authentication",
     tokenPlaceholder: "Leave empty to disable",
 
     // Skills
@@ -295,6 +300,7 @@ const translations = {
     // Endpoint links
     copySSE: "Copy SSE JSON",
     copyHTTP: "Copy HTTP JSON",
+    dragServerReorder: "Drag this header to reorder servers",
     noEnabledServers: "No enabled servers — add a server and restart",
     endpointSSE: "SSE",
     endpointHTTP: "HTTP",
@@ -359,4 +365,3 @@ export type TKey = keyof typeof translations.zh;
 export function useT(lang: Lang) {
   return (key: TKey): string => translations[lang][key];
 }
-
