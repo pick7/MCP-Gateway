@@ -7,6 +7,9 @@ use gateway_core::{AppError, GatewayConfig, ServerConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::ai_adapter::session::AiToolDef;
+
+use crate::ai_adapter::session::AiSession;
 use crate::response::{self, ApiResult};
 use crate::state::AppState;
 use crate::{ActivePlanSummary, SkillConfirmation, SkillSummary};
@@ -69,6 +72,30 @@ pub fn router(state: AppState, api_prefix: &str) -> Router {
                 prefix
             ),
             post(reject_skill_confirmation),
+        )
+        .route(
+            &format!("{}/admin/ai-sessions", prefix),
+            get(get_ai_sessions),
+        )
+        .route(
+            &format!("{}/admin/ai-sessions/:session_id/rename", prefix),
+            post(rename_ai_session),
+        )
+        .route(
+            &format!("{}/admin/ai-sessions/:session_id/tools/:tool_name", prefix),
+            put(toggle_ai_session_tool),
+        )
+        .route(
+            &format!("{}/admin/ai-sessions/:session_id", prefix),
+            delete(delete_ai_session),
+        )
+        .route(
+            &format!("{}/admin/ai-sessions/:session_id/system-prompt", prefix),
+            put(update_ai_session_system_prompt),
+        )
+        .route(
+            &format!("{}/admin/ai-sessions/:session_id/system-prompt-tool", prefix),
+            put(toggle_ai_session_system_prompt_tool),
         )
         .with_state(state)
 }
@@ -408,6 +435,42 @@ pub async fn export_mcp_servers_payload(State(state): State<AppState>) -> ApiRes
         );
     }
 
+    // AI Adapter 会话
+    {
+        let sessions = state.ai_sessions.list_sessions().await;
+        for session in &sessions {
+            let url = format!(
+                "{}{}{}",
+                base_url,
+                cfg.transport
+                    .streamable_http
+                    .base_path
+                    .trim_end_matches('/'),
+                format_args!("/{}", percent_encoding::utf8_percent_encode(&session.name, percent_encoding::NON_ALPHANUMERIC))
+            );
+
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "name".to_string(),
+                Value::String(format!("AI Adapter: {}", session.name)),
+            );
+            entry.insert(
+                "type".to_string(),
+                Value::String("streamable-http".to_string()),
+            );
+            entry.insert("url".to_string(), Value::String(url));
+
+            if cfg.security.mcp.enabled {
+                entry.insert(
+                    "headers".to_string(),
+                    json!({"Authorization": format!("Bearer {}", cfg.security.mcp.token)}),
+                );
+            }
+
+            mcp_servers.insert(session.name.clone(), Value::Object(entry));
+        }
+    }
+
     Ok(response::ok(
         json!({"mcpServers": Value::Object(mcp_servers)}),
     ))
@@ -534,6 +597,117 @@ pub async fn reject_skill_confirmation(
         .await
         .map_err(response::err_response)?;
     Ok(response::ok(updated))
+}
+
+// ── AI Adapter 会话管理 API ──
+
+#[utoipa::path(
+    get,
+    path = "/api/v2/admin/ai-sessions",
+    responses((status = 200, description = "AI adapter sessions"))
+)]
+pub async fn get_ai_sessions(State(state): State<AppState>) -> ApiResult<Vec<AiSession>> {
+    let sessions = state.ai_sessions.list_sessions().await;
+    Ok(response::ok(sessions))
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct RenameSessionBody {
+    pub name: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v2/admin/ai-sessions/{session_id}/rename",
+    request_body = RenameSessionBody,
+    params(("session_id" = String, Path, description = "Session ID")),
+    responses((status = 200, description = "Session renamed"))
+)]
+pub async fn rename_ai_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<RenameSessionBody>,
+) -> ApiResult<AiSession> {
+    let updated = state
+        .ai_sessions
+        .rename_session(&session_id, &body.name)
+        .await
+        .map_err(|e| response::err_response(AppError::BadRequest(e)))?;
+    Ok(response::ok(updated))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v2/admin/ai-sessions/{session_id}",
+    params(("session_id" = String, Path, description = "Session ID")),
+    responses((status = 200, description = "Session deleted"))
+)]
+pub async fn delete_ai_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> ApiResult<Value> {
+    let removed = state.ai_sessions.remove_session(&session_id).await;
+    Ok(response::ok(
+        json!({"sessionId": session_id, "removed": removed}),
+    ))
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ToggleToolBody {
+    pub enabled: bool,
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v2/admin/ai-sessions/{session_id}/tools/{tool_name}",
+    request_body = ToggleToolBody,
+    params(
+        ("session_id" = String, Path, description = "Session ID"),
+        ("tool_name" = String, Path, description = "Tool name")
+    ),
+    responses((status = 200, description = "Tool toggled"))
+)]
+pub async fn toggle_ai_session_tool(
+    State(state): State<AppState>,
+    Path((session_id, tool_name)): Path<(String, String)>,
+    Json(body): Json<ToggleToolBody>,
+) -> ApiResult<AiToolDef> {
+    let updated = state
+        .ai_sessions
+        .toggle_tool(&session_id, &tool_name, body.enabled)
+        .await
+        .map_err(|e| response::err_response(AppError::BadRequest(e)))?;
+    Ok(response::ok(updated))
+}
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct UpdateSystemPromptBody {
+    pub text: Option<String>,
+}
+
+pub async fn update_ai_session_system_prompt(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<UpdateSystemPromptBody>,
+) -> ApiResult<Value> {
+    state
+        .ai_sessions
+        .update_system_prompt(&session_id, body.text.clone())
+        .await
+        .map_err(|e| response::err_response(AppError::BadRequest(e)))?;
+    Ok(response::ok(json!({ "sessionId": session_id, "systemPromptOverride": body.text })))
+}
+
+pub async fn toggle_ai_session_system_prompt_tool(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<ToggleToolBody>,
+) -> ApiResult<Value> {
+    let enabled = state
+        .ai_sessions
+        .toggle_system_prompt_tool(&session_id, body.enabled)
+        .await
+        .map_err(|e| response::err_response(AppError::BadRequest(e)))?;
+    Ok(response::ok(json!({ "sessionId": session_id, "systemPromptToolEnabled": enabled })))
 }
 
 fn gateway_base_url(listen: &str) -> Result<String, AppError> {

@@ -183,7 +183,11 @@ fn is_path_like(token: &str) -> bool {
         return false;
     }
     // rg glob patterns: !pattern, *.{ext}, **, etc.
-    if token.starts_with('!') || token.contains('*') || token.contains('?') {
+    if token.starts_with('!') || token.contains('*') || token.contains('?') || token.contains('[') || token.contains(']') {
+        return false;
+    }
+    // regex anchors: $ (end) and ^ (start) do not appear in real paths
+    if token.contains('$') || token.contains('^') {
         return false;
     }
     if token.starts_with("~/")

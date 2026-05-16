@@ -1257,6 +1257,7 @@ dependencies = [
  "futures-util",
  "gateway-core",
  "http",
+ "percent-encoding",
  "serde",
  "serde_json",
  "serde_yaml",

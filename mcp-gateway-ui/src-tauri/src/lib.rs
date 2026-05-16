@@ -13,7 +13,7 @@ use gateway_core::{
     detect_terminal_encoding_status, load_config_from_path, ConfigService, GatewayConfig,
     ProcessManager, ServerAuthState, ServerConfig, SkillCommandRule, TerminalEncodingStatus,
 };
-use gateway_http::{build_router, spawn_idle_reaper, AppState, SkillsService, SseHub};
+use gateway_http::{build_router, spawn_idle_reaper, AiSessionManager, AppState, SkillsService, SseHub};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{Manager, State};
@@ -283,6 +283,7 @@ async fn start_embedded_gateway(config_path: PathBuf) -> Result<ManagedGateway, 
         started_at: Utc::now(),
         sse_hub: SseHub::new(),
         skills: SkillsService::new(),
+        ai_sessions: AiSessionManager::new(),
     };
 
     let router = build_router(state.clone(), &cfg);
