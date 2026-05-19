@@ -39,21 +39,24 @@ Bundled Skills:  /api/v2/sse/__builtin_skills__
 Bundled Skills:  /api/v2/mcp/__builtin_skills__
 ```
 
-The AI Adapter exposes an OpenAI/Anthropic-compatible base URL for BYOK-style AI coding tools:
+The AI Adapter UI copies a user-friendly OpenAI/Anthropic-compatible Base URL for BYOK-style AI coding tools:
 
 ```text
 Base URL: http://<listenAddress>/api/v2/ai/v1
 ```
 
-Clients then auto-discover these endpoints from the base URL:
+The backend canonical AI Adapter base path remains `/api/v2/ai`. Clients can call these canonical protocol endpoints:
 
 ```text
-List models:  GET  /api/v2/ai/v1/v1/models
-Chat:         POST /api/v2/ai/v1/v1/chat/completions
-Responses:    POST /api/v2/ai/v1/v1/responses
-Messages:     POST /api/v2/ai/v1/v1/messages
-Health:       GET  /api/v2/ai/v1/health
+List models:  GET  /api/v2/ai/v1/models
+Chat:         POST /api/v2/ai/v1/chat/completions
+Responses:    POST /api/v2/ai/v1/responses
+Messages:     POST /api/v2/ai/v1/messages
+Token Count:  POST /api/v2/ai/v1/messages/count_tokens
+Health:       GET  /api/v2/ai/health
 ```
+
+For clients that automatically append another `/v1` to the copied Base URL, the backend also accepts the compatible `/api/v2/ai/v1/v1/...` paths, including models, chat completions, responses, Anthropic messages, and token counting. Claude Code users do not need to remove `/v1` from the Base URL copied from the UI.
 
 If `MCP Token` is configured, clients should send:
 

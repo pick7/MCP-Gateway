@@ -298,8 +298,8 @@ export interface AiSession {
   toolCount: number;
   hasSystemPrompt: boolean;
   systemPromptToolEnabled: boolean;
+  toolPingEnabled: boolean;
   systemPromptOverride?: string | null;
   hasPendingCall: boolean;
 }
-
 

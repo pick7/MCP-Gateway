@@ -15,11 +15,6 @@ const MENU_QUIT: &str = "mcp-gateway-tray-quit";
 /// instead of hiding to tray.
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Tracks whether we already hid the window in response to the current
-/// minimize gesture, so the stream of `Resized` events that follow do not
-/// trigger redundant `hide()` calls.
-static HIDDEN_FOR_MINIMIZE: AtomicBool = AtomicBool::new(false);
-
 #[derive(Clone, Copy)]
 struct TrayLabels {
     show: &'static str,
@@ -85,24 +80,7 @@ pub fn install<R: Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
                     return;
                 }
                 api.prevent_close();
-                HIDDEN_FOR_MINIMIZE.store(false, Ordering::SeqCst);
                 let _ = window_for_event.hide();
-            }
-            // Tauri 2.10 does not surface a dedicated `Minimized` variant.
-            // Minimize gestures arrive as `Resized` events, so we check
-            // `is_minimized()` and route those to the tray as well.
-            WindowEvent::Resized(_) => {
-                if QUIT_REQUESTED.load(Ordering::SeqCst) {
-                    return;
-                }
-                let minimized = window_for_event.is_minimized().unwrap_or(false);
-                if minimized {
-                    if !HIDDEN_FOR_MINIMIZE.swap(true, Ordering::SeqCst) {
-                        let _ = window_for_event.hide();
-                    }
-                } else {
-                    HIDDEN_FOR_MINIMIZE.store(false, Ordering::SeqCst);
-                }
             }
             _ => {}
         });
@@ -160,7 +138,6 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
-        HIDDEN_FOR_MINIMIZE.store(false, Ordering::SeqCst);
     }
 }
 

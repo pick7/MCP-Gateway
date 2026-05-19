@@ -367,6 +367,10 @@ const translations = {
     sessionToolsModalTitle: "会话工具",
     sessionToolsEmpty: "该会话暂未注册任何工具。",
     sessionToolsFooterHint: "开关实时生效，无需重启网关。只有打开的工具才会暴露给 MCP 客户端。",
+    sessionToolPing: "工具 Ping",
+    sessionToolPingDesc: "默认开启，用工具调用维持长连接；如果出现错误工具调用导致会话中断，可关闭此开关。",
+    sessionToolPingTitle: "开启时使用工具调用维持会话；遇到错误工具调用导致会话中断时可关闭。",
+    sessionToolPingEnableLabel: "启用工具 Ping",
     systemPrompt: "系统提示词工具",
     systemPromptTitle: "系统提示词",
     systemPromptDesc: "启用后会在 AI 适配器 MCP 工具列表中添加 system_prompt 工具，供 AI 读取管理员设置的系统提示词和 skillToken 使用说明。",
@@ -749,6 +753,10 @@ const translations = {
     sessionToolsModalTitle: "Session Tools",
     sessionToolsEmpty: "This session has no registered tools.",
     sessionToolsFooterHint: "Toggles take effect immediately without restart. Only enabled tools are exposed to MCP clients.",
+    sessionToolPing: "Tool Ping",
+    sessionToolPingDesc: "On by default. Uses tool calls to keep long sessions alive; turn it off if erroneous tool calls interrupt the session.",
+    sessionToolPingTitle: "Uses tool calls to keep the session alive; turn it off if erroneous tool calls interrupt the session.",
+    sessionToolPingEnableLabel: "Enable Tool Ping",
     systemPrompt: "System Prompt Tool",
     systemPromptTitle: "System Prompt",
     systemPromptDesc: "When enabled, adds a system_prompt tool to the AI adapter MCP tool list, allowing AI to read the system prompt and skillToken instructions set by admin.",
@@ -774,4 +782,3 @@ export type TFunction = (key: TKey) => string;
 export function useT(lang: Lang): TFunction {
   return (key: TKey): string => translations[lang][key];
 }
-

@@ -100,6 +100,10 @@ pub fn router(state: AppState, api_prefix: &str) -> Router {
             ),
             put(toggle_ai_session_system_prompt_tool),
         )
+        .route(
+            &format!("{}/admin/ai-sessions/:session_id/tool-ping", prefix),
+            put(toggle_ai_session_tool_ping),
+        )
         .with_state(state)
 }
 
@@ -341,143 +345,64 @@ pub async fn get_server_tools(
 pub async fn export_mcp_servers_payload(State(state): State<AppState>) -> ApiResult<Value> {
     let cfg = state.config_service.get_config().await;
     let base_url = gateway_base_url(&cfg.listen).map_err(response::err_response)?;
+    let transport_base = cfg
+        .transport
+        .streamable_http
+        .base_path
+        .trim_end_matches('/');
+
+    let maybe_auth_header = if cfg.security.mcp.enabled {
+        Some(json!({"Authorization": format!("Bearer {}", cfg.security.mcp.token)}))
+    } else {
+        None
+    };
+
+    let build_entry = |name: &str, server_path: &str| -> Value {
+        let url = format!("{}{}/{}", base_url, transport_base, server_path);
+        let mut entry = serde_json::Map::new();
+        entry.insert("name".to_string(), Value::String(name.to_string()));
+        entry.insert(
+            "type".to_string(),
+            Value::String("streamable-http".to_string()),
+        );
+        entry.insert("url".to_string(), Value::String(url));
+        if let Some(ref h) = maybe_auth_header {
+            entry.insert("headers".to_string(), h.clone());
+        }
+        Value::Object(entry)
+    };
 
     let mut mcp_servers = serde_json::Map::new();
     for server in cfg.servers.iter().filter(|item| item.enabled) {
-        let url = format!(
-            "{}{}{}",
-            base_url,
-            cfg.transport
-                .streamable_http
-                .base_path
-                .trim_end_matches('/'),
-            format_args!("/{}", server.name)
-        );
-
-        let mut entry = serde_json::Map::new();
-        entry.insert("name".to_string(), Value::String(server.display_name()));
-        entry.insert(
-            "type".to_string(),
-            Value::String("streamable-http".to_string()),
-        );
-        entry.insert("url".to_string(), Value::String(url));
-
-        if cfg.security.mcp.enabled {
-            entry.insert(
-                "headers".to_string(),
-                json!({"Authorization": format!("Bearer {}", cfg.security.mcp.token)}),
-            );
-        }
-
-        mcp_servers.insert(server.name.clone(), Value::Object(entry));
-    }
-
-    {
-        let url = format!(
-            "{}{}{}",
-            base_url,
-            cfg.transport
-                .streamable_http
-                .base_path
-                .trim_end_matches('/'),
-            format_args!("/{}", cfg.skills.server_name)
-        );
-
-        let mut entry = serde_json::Map::new();
-        entry.insert(
-            "name".to_string(),
-            Value::String("External Skills MCP".to_string()),
-        );
-        entry.insert(
-            "type".to_string(),
-            Value::String("streamable-http".to_string()),
-        );
-        entry.insert("url".to_string(), Value::String(url));
-
-        if cfg.security.mcp.enabled {
-            entry.insert(
-                "headers".to_string(),
-                json!({"Authorization": format!("Bearer {}", cfg.security.mcp.token)}),
-            );
-        }
-
-        mcp_servers.insert(cfg.skills.server_name.clone(), Value::Object(entry));
-
-        // Built-in skills MCP entry
-        let builtin_url = format!(
-            "{}{}{}",
-            base_url,
-            cfg.transport
-                .streamable_http
-                .base_path
-                .trim_end_matches('/'),
-            format_args!("/{}", cfg.skills.builtin_server_name)
-        );
-
-        let mut builtin_entry = serde_json::Map::new();
-        builtin_entry.insert(
-            "name".to_string(),
-            Value::String("Built-in Skills MCP".to_string()),
-        );
-        builtin_entry.insert(
-            "type".to_string(),
-            Value::String("streamable-http".to_string()),
-        );
-        builtin_entry.insert("url".to_string(), Value::String(builtin_url));
-
-        if cfg.security.mcp.enabled {
-            builtin_entry.insert(
-                "headers".to_string(),
-                json!({"Authorization": format!("Bearer {}", cfg.security.mcp.token)}),
-            );
-        }
-
         mcp_servers.insert(
-            cfg.skills.builtin_server_name.clone(),
-            Value::Object(builtin_entry),
+            server.name.clone(),
+            build_entry(&server.display_name(), &server.name),
         );
     }
+
+    mcp_servers.insert(
+        cfg.skills.server_name.clone(),
+        build_entry("External Skills MCP", &cfg.skills.server_name),
+    );
+    mcp_servers.insert(
+        cfg.skills.builtin_server_name.clone(),
+        build_entry("Built-in Skills MCP", &cfg.skills.builtin_server_name),
+    );
 
     // AI Adapter 会话
-    {
-        let sessions = state.ai_sessions.list_sessions().await;
-        for session in &sessions {
-            let url = format!(
-                "{}{}{}",
-                base_url,
-                cfg.transport
-                    .streamable_http
-                    .base_path
-                    .trim_end_matches('/'),
-                format_args!(
-                    "/{}",
-                    percent_encoding::utf8_percent_encode(
-                        &session.name,
-                        percent_encoding::NON_ALPHANUMERIC
-                    )
-                )
-            );
-
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "name".to_string(),
-                Value::String(format!("AI Adapter: {}", session.name)),
-            );
-            entry.insert(
-                "type".to_string(),
-                Value::String("streamable-http".to_string()),
-            );
-            entry.insert("url".to_string(), Value::String(url));
-
-            if cfg.security.mcp.enabled {
-                entry.insert(
-                    "headers".to_string(),
-                    json!({"Authorization": format!("Bearer {}", cfg.security.mcp.token)}),
-                );
-            }
-
-            mcp_servers.insert(session.name.clone(), Value::Object(entry));
-        }
+    let sessions = state.ai_sessions.list_sessions().await;
+    for session in &sessions {
+        let encoded_name = percent_encoding::utf8_percent_encode(
+            &session.name,
+            percent_encoding::NON_ALPHANUMERIC,
+        );
+        mcp_servers.insert(
+            session.name.clone(),
+            build_entry(
+                &format!("AI Adapter: {}", session.name),
+                &encoded_name.to_string(),
+            ),
+        );
     }
 
     Ok(response::ok(
@@ -720,6 +645,21 @@ pub async fn toggle_ai_session_system_prompt_tool(
         .map_err(|e| response::err_response(AppError::BadRequest(e)))?;
     Ok(response::ok(
         json!({ "sessionId": session_id, "systemPromptToolEnabled": enabled }),
+    ))
+}
+
+pub async fn toggle_ai_session_tool_ping(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<ToggleToolBody>,
+) -> ApiResult<Value> {
+    let enabled = state
+        .ai_sessions
+        .toggle_tool_ping(&session_id, body.enabled)
+        .await
+        .map_err(|e| response::err_response(AppError::BadRequest(e)))?;
+    Ok(response::ok(
+        json!({ "sessionId": session_id, "toolPingEnabled": enabled }),
     ))
 }
 

@@ -56,6 +56,8 @@ pub struct AiSession {
 
     /// Whether the system_prompt tool is enabled for this session
     pub system_prompt_tool_enabled: bool,
+    /// Whether heartbeat should use a synthetic tool call for this session.
+    pub tool_ping_enabled: bool,
     /// User-overridden system prompt text (None = use original)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt_override: Option<String>,
@@ -103,6 +105,7 @@ struct SessionState {
     pub protocol: AiProtocol,
     pub system_prompt: String,
     pub system_prompt_tool_enabled: bool,
+    pub tool_ping_enabled: bool,
     pub system_prompt_override: Option<String>,
     pub tools: Vec<AiToolDef>,
     pub connected_at: DateTime<Utc>,
@@ -167,6 +170,7 @@ impl AiSessionManager {
             protocol,
             system_prompt: system_prompt.clone(),
             system_prompt_tool_enabled: true,
+            tool_ping_enabled: true,
             system_prompt_override: None,
             tools: tools.clone(),
             connected_at: now,
@@ -189,6 +193,7 @@ impl AiSessionManager {
             protocol,
             system_prompt: system_prompt.clone(),
             system_prompt_tool_enabled: true,
+            tool_ping_enabled: true,
             system_prompt_override: None,
             tool_count: tools.len(),
             tools,
@@ -245,6 +250,7 @@ impl AiSessionManager {
             connected_at: s.connected_at,
             has_system_prompt: !s.system_prompt.is_empty(),
             system_prompt_tool_enabled: s.system_prompt_tool_enabled,
+            tool_ping_enabled: s.tool_ping_enabled,
             system_prompt_override: s.system_prompt_override.clone(),
             has_pending_call: !s.pending_calls.is_empty() || !s.inflight_calls.is_empty(),
         }
@@ -431,6 +437,23 @@ impl AiSessionManager {
         Ok(enabled)
     }
 
+    /// Toggle synthetic tool-call heartbeat for a session.
+    pub async fn toggle_tool_ping(&self, session_id: &str, enabled: bool) -> Result<bool, String> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        state.tool_ping_enabled = enabled;
+        Ok(enabled)
+    }
+
+    pub async fn tool_ping_enabled(&self, session_id: &str) -> Option<bool> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_id)
+            .map(|state| state.tool_ping_enabled)
+    }
+
     /// Update the system prompt override for a session
     pub async fn update_system_prompt(
         &self,
@@ -485,16 +508,15 @@ impl AiSessionManager {
     /// so we can extract the session_id directly without searching.
     /// Falls back to scanning all sessions if the format doesn't match.
     pub async fn find_session_by_call_id(&self, call_id: &str) -> Option<String> {
+        let sessions = self.sessions.read().await;
         // Try to extract session_id from call_id prefix
         if let Some(colon_pos) = call_id.find(':') {
             let candidate_id = &call_id[..colon_pos];
-            let sessions = self.sessions.read().await;
             if sessions.contains_key(candidate_id) {
                 return Some(candidate_id.to_string());
             }
         }
         // Fallback: scan all sessions
-        let sessions = self.sessions.read().await;
         for (session_id, state) in sessions.iter() {
             if state.pending_calls.iter().any(|p| p.call_id == call_id) {
                 return Some(session_id.clone());

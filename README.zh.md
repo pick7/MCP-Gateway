@@ -39,21 +39,24 @@ Skill 端点是固定的：
 内置 Skills: /api/v2/mcp/__builtin_skills__
 ```
 
-AI 外接适配器会暴露一个兼容 OpenAI / Anthropic 协议的 Base URL，供支持自定义 API 的 AI 编程工具使用：
+AI 外接适配器界面会复制一个用户友好的 OpenAI / Anthropic 兼容 Base URL，供支持自定义 API 的 AI 编程工具使用：
 
 ```text
 Base URL: http://<监听地址>/api/v2/ai/v1
 ```
 
-客户端接入后会自动发现以下接口：
+后端规范基准路径仍是 `/api/v2/ai`。客户端可调用以下 canonical 协议接口：
 
 ```text
-模型列表:  GET  /api/v2/ai/v1/v1/models
-对话:      POST /api/v2/ai/v1/v1/chat/completions
-响应:      POST /api/v2/ai/v1/v1/responses
-消息:      POST /api/v2/ai/v1/v1/messages
-健康检查:  GET  /api/v2/ai/v1/health
+模型列表:  GET  /api/v2/ai/v1/models
+对话:      POST /api/v2/ai/v1/chat/completions
+响应:      POST /api/v2/ai/v1/responses
+消息:      POST /api/v2/ai/v1/messages
+Token 计数: POST /api/v2/ai/v1/messages/count_tokens
+健康检查:  GET  /api/v2/ai/health
 ```
+
+如果客户端会在复制出来的 Base URL 后自动再拼一层 `/v1`，后端也接受兼容路径 `/api/v2/ai/v1/v1/...`，包括模型列表、对话、Responses、Anthropic Messages 和 Token 计数。Claude Code 用户不需要手动删除界面复制地址里的 `/v1`。
 
 如果配置了 `MCP Token`，客户端请求需要带上：
 

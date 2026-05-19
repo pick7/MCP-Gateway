@@ -1,9 +1,8 @@
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
@@ -38,15 +37,17 @@ fn heartbeat_token(session_id: &str) -> String {
 
 // ── Helper functions ──
 
-fn extract_api_key(headers: &HeaderMap, config: &AiAdapterConfig) -> String {
-    let valid_keys: Vec<&str> = config
+fn valid_keys(config: &AiAdapterConfig) -> Vec<&str> {
+    config
         .api_keys
         .iter()
         .map(|s| s.as_str())
         .filter(|s| !s.is_empty())
-        .collect();
+        .collect()
+}
 
-    if valid_keys.is_empty() {
+fn extract_api_key_from(headers: &HeaderMap, keys: &[&str]) -> String {
+    if keys.is_empty() {
         return String::new();
     }
 
@@ -55,7 +56,7 @@ fn extract_api_key(headers: &HeaderMap, config: &AiAdapterConfig) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    for key in &valid_keys {
+    for key in keys {
         let expected = format!("Bearer {}", key);
         if auth == expected {
             return key.to_string();
@@ -119,34 +120,23 @@ fn arguments_to_json_string(value: &Value) -> String {
 
 /// Check API key auth. Returns true if authorized (or no keys configured).
 fn check_auth(headers: &HeaderMap, config: &AiAdapterConfig) -> bool {
-    let valid_keys: Vec<&str> = config
-        .api_keys
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if valid_keys.is_empty() {
+    let keys = valid_keys(config);
+    if keys.is_empty() {
         return true;
     }
-    !extract_api_key(headers, config).is_empty()
+    !extract_api_key_from(headers, &keys).is_empty()
 }
 
 /// Anthropic: x-api-key, no sk-ant prefix check
-fn extract_anthropic_api_key(headers: &HeaderMap, config: &AiAdapterConfig) -> String {
-    let valid_keys: Vec<&str> = config
-        .api_keys
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if valid_keys.is_empty() {
+fn extract_anthropic_api_key_from(headers: &HeaderMap, keys: &[&str]) -> String {
+    if keys.is_empty() {
         return String::new();
     }
     let api_key = headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    for key in &valid_keys {
+    for key in keys {
         if api_key == *key {
             return key.to_string();
         }
@@ -154,44 +144,169 @@ fn extract_anthropic_api_key(headers: &HeaderMap, config: &AiAdapterConfig) -> S
     String::new()
 }
 
+fn check_anthropic_auth(headers: &HeaderMap, config: &AiAdapterConfig) -> bool {
+    let keys = valid_keys(config);
+    if keys.is_empty() {
+        return true;
+    }
+    if !extract_api_key_from(headers, &keys).is_empty() {
+        return true;
+    }
+    !extract_anthropic_api_key_from(headers, &keys).is_empty()
+}
+
 // ── Routes ──
 
 pub fn router(state: AppState, config: &AiAdapterConfig) -> Router {
     let base = config.base_path.trim_end_matches('/').to_string();
-    Router::new()
-        .route(&format!("{}/v1/models", base), get(handle_models))
-        .route(
-            &format!("{}/v1/chat/completions", base),
-            post(handle_openai_chat),
-        )
-        .route(
-            &format!("{}/v1/responses", base),
-            post(handle_openai_responses),
-        )
-        .route(
-            &format!("{}/v1/messages", base),
-            post(handle_anthropic_messages),
-        )
-        .route(&format!("{}/health", base), get(handle_ai_health))
+    // Register each AI route under both /v1/... and the legacy /v1/v1/... path
+    // so that clients using either base-path convention can connect.
+    let mut r = Router::new();
+    macro_rules! ai_route {
+        ($path:literal, $method:ident($handler:ident)) => {
+            r = r
+                .route(&format!(concat!("{}/v1", $path), base), $method($handler))
+                .route(
+                    &format!(concat!("{}/v1/v1", $path), base),
+                    $method($handler),
+                );
+        };
+    }
+    ai_route!("/models", get(handle_models));
+    ai_route!("/models/:model_id", get(handle_model_retrieve));
+    ai_route!("/chat/completions", post(handle_openai_chat));
+    ai_route!("/responses", post(handle_openai_responses));
+    ai_route!("/messages", post(handle_anthropic_messages));
+    ai_route!(
+        "/messages/count_tokens",
+        post(handle_anthropic_count_tokens)
+    );
+    r.route(&format!("{}/health", base), get(handle_ai_health))
         .with_state(state)
 }
 
 // ── GET endpoints ──
 
+/// 已知模型清单：(id, display_name, owned_by)。
+/// `/v1/models` 列表与 `/v1/models/{id}` 单查都从这里读取，
+/// 这样不同协议风格的客户端拿到的内容保持一致。
+const KNOWN_MODELS: &[(&str, &str, &str)] = &[
+    (RESPONSE_MODEL, "MCP Gateway", "mcp-gateway"),
+    ("claude-opus-4-7", "Claude Opus 4.7", "anthropic"),
+    ("gpt-5.5", "GPT-5.5", "openai"),
+];
+
+/// Anthropic schema 要求 `created_at` 是 ISO-8601 字符串。
+const ANTHROPIC_MODEL_CREATED_AT: &str = "2025-01-01T00:00:00Z";
+
+/// Claude Code / Anthropic SDK 调用时一般会带 `anthropic-version`，
+/// 部分场景下只用 `x-api-key` 而不是 `Authorization`。任一命中都按 Anthropic 风格响应。
+fn is_anthropic_client(headers: &HeaderMap) -> bool {
+    headers.contains_key("anthropic-version") || headers.contains_key("x-api-key")
+}
+
+fn openai_model_entry(id: &str, owned_by: &str) -> Value {
+    json!({
+        "id": id,
+        "object": "model",
+        "created": 1,
+        "owned_by": owned_by,
+    })
+}
+
+fn anthropic_model_entry(id: &str, display_name: &str) -> Value {
+    json!({
+        "type": "model",
+        "id": id,
+        "display_name": display_name,
+        "created_at": ANTHROPIC_MODEL_CREATED_AT,
+    })
+}
+
+/// `/v1/models*` 同时接受 `Authorization: Bearer ...` 与 `x-api-key`，
+/// 避免 Claude Code 在做模型枚举/单查时被误判为未授权。
+fn check_models_auth(headers: &HeaderMap, config: &AiAdapterConfig) -> bool {
+    check_anthropic_auth(headers, config)
+}
+
 async fn handle_models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let config = state.config_service.get_config().await;
-    if !check_auth(&headers, &config.ai_adapter) {
+    if !check_models_auth(&headers, &config.ai_adapter) {
         return unauthorized_response();
     }
+
+    if is_anthropic_client(&headers) {
+        let data: Vec<Value> = KNOWN_MODELS
+            .iter()
+            .map(|(id, display, _owner)| anthropic_model_entry(id, display))
+            .collect();
+        let first = data
+            .first()
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(Value::Null);
+        let last = data
+            .last()
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(Value::Null);
+        return Json(json!({
+            "data": data,
+            "has_more": false,
+            "first_id": first,
+            "last_id": last,
+        }))
+        .into_response();
+    }
+
+    let data: Vec<Value> = KNOWN_MODELS
+        .iter()
+        .map(|(id, _display, owner)| openai_model_entry(id, owner))
+        .collect();
     Json(json!({
         "object": "list",
-        "data": [
-            {"id": RESPONSE_MODEL, "object": "model", "created": 1, "owned_by": "mcp-gateway"},
-            {"id": "claude-opus-4-7", "object": "model", "created": 1, "owned_by": "anthropic"},
-            {"id": "gpt-5.5", "object": "model", "created": 1, "owned_by": "openai"}
-        ]
+        "data": data,
     }))
     .into_response()
+}
+
+async fn handle_model_retrieve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(model_id): Path<String>,
+) -> axum::response::Response {
+    let config = state.config_service.get_config().await;
+    if !check_models_auth(&headers, &config.ai_adapter) {
+        return unauthorized_response();
+    }
+
+    let Some((id, display_name, owner)) = KNOWN_MODELS
+        .iter()
+        .find(|(known_id, _, _)| *known_id == model_id.as_str())
+    else {
+        let err_type = if is_anthropic_client(&headers) {
+            "not_found_error"
+        } else {
+            "invalid_request_error"
+        };
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": format!(
+                        "model `{}` does not exist or you do not have access to it",
+                        model_id
+                    ),
+                    "type": err_type,
+                }
+            })),
+        )
+            .into_response();
+    };
+
+    if is_anthropic_client(&headers) {
+        Json(anthropic_model_entry(id, display_name)).into_response()
+    } else {
+        Json(openai_model_entry(id, owner)).into_response()
+    }
 }
 
 async fn handle_ai_health(State(state): State<AppState>) -> impl IntoResponse {
@@ -305,13 +420,14 @@ async fn handle_openai_chat(
     let mut tools = extract_openai_tools(&request.tools);
     let source = extract_source(&headers);
 
-    // Apply disabled_tools from config: if name+description match, default to disabled
-    {
-        let cfg = state.config_service.get_config().await;
-        for tool in &mut tools {
-            if cfg.disabled_tools.iter().any(|dt| dt.matches(&tool.name)) {
-                tool.enabled = false;
-            }
+    // Apply disabled_tools from config snapshot taken above
+    for tool in &mut tools {
+        if config
+            .disabled_tools
+            .iter()
+            .any(|dt| dt.matches(&tool.name))
+        {
+            tool.enabled = false;
         }
     }
 
@@ -355,25 +471,40 @@ async fn handle_openai_chat_tool_results(
     chat_sse_response(state.ai_sessions.clone(), session_id.to_string())
 }
 
-fn chat_sse_response(
-    ai_sessions: AiSessionManager,
-    session_id: String,
-) -> axum::response::Response {
-    let session_id_header = session_id.clone();
+fn build_sse_response(
+    session_id: &str,
+    response_id_prefix: &str,
+    id_len: usize,
+) -> (String, String, mpsc::Sender<Event>, mpsc::Receiver<Event>) {
+    let session_id_header = session_id.to_string();
     let response_id = format!(
-        "chatcmpl-{}",
-        &Uuid::new_v4().to_string().replace('-', "")[..29]
+        "{}{}",
+        response_id_prefix,
+        &Uuid::new_v4().to_string().replace('-', "")[..id_len]
     );
     let (tx, rx) = mpsc::channel::<Event>(16);
+    (session_id_header, response_id, tx, rx)
+}
 
-    spawn_chat_pump(ai_sessions, session_id, response_id, tx);
-
+fn sse_response_from_parts(
+    session_id_header: String,
+    rx: mpsc::Receiver<Event>,
+) -> axum::response::Response {
     let stream = ReceiverStream::new(rx).map(Ok::<Event, Infallible>);
     let mut resp = Sse::new(stream).into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&session_id_header) {
         resp.headers_mut().insert("X-Session-Id", v);
     }
     resp
+}
+
+fn chat_sse_response(
+    ai_sessions: AiSessionManager,
+    session_id: String,
+) -> axum::response::Response {
+    let (sid_hdr, response_id, tx, rx) = build_sse_response(&session_id, "chatcmpl-", 29);
+    spawn_chat_pump(ai_sessions, session_id, response_id, tx);
+    sse_response_from_parts(sid_hdr, rx)
 }
 
 fn spawn_chat_pump(
@@ -387,7 +518,6 @@ fn spawn_chat_pump(
             .await
             .is_err()
         {
-            // tx.send failed => client disconnected, clean up session
             ai_sessions.remove_session(&session_id).await;
         }
     });
@@ -401,26 +531,35 @@ async fn run_chat_pump(
 ) -> Result<(), ()> {
     let dur = Duration::from_secs(SSE_HEARTBEAT_INTERVAL_SECS);
     let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + dur, dur);
-    tokio::select! {
-        biased;
-        call = ai_sessions.wait_for_pending_call(session_id) => {
-            match call {
-                Some(tc) => {
-                    for ev in yield_chat_tool_call_events(response_id, &tc) {
+    loop {
+        tokio::select! {
+            biased;
+            call = ai_sessions.wait_for_pending_call(session_id) => {
+                match call {
+                    Some(tc) => {
+                        for ev in yield_chat_tool_call_events(response_id, &tc) {
+                            tx.send(ev).await.map_err(|_| ())?;
+                        }
+                        return Ok(());
+                    }
+                    None => return Ok(()),
+                }
+            }
+            _ = heartbeat.tick() => {
+                if ai_sessions.tool_ping_enabled(session_id).await.unwrap_or(true) {
+                    for ev in chat_heartbeat_events(response_id, session_id) {
                         tx.send(ev).await.map_err(|_| ())?;
                     }
-                    Ok(())
+                    return Ok(());
                 }
-                None => Ok(()),
+                tx.send(openai_sse_ping_event()).await.map_err(|_| ())?;
             }
-        }
-        _ = heartbeat.tick() => {
-            for ev in chat_heartbeat_events(response_id, session_id) {
-                tx.send(ev).await.map_err(|_| ())?;
-            }
-            Ok(())
         }
     }
+}
+
+fn openai_sse_ping_event() -> Event {
+    Event::default().comment("keep-alive")
 }
 
 fn chat_heartbeat_events(response_id: &str, session_id: &str) -> Vec<Event> {
@@ -481,13 +620,22 @@ fn collect_responses_tool_outputs(input: &Value) -> Vec<(String, String)> {
 
 fn yield_responses_tool_call_events(
     response_id: &str,
-    seq: &Arc<AtomicU64>,
+    seq: &AtomicU64,
     tc: &PendingToolCall,
 ) -> Vec<Event> {
-    let item_id = format!("fc_{}", &Uuid::new_v4().to_string().replace("-", "")[..24]);
-    let call_id = tc.call_id.clone();
     let arguments = arguments_to_json_string(&tc.arguments);
+    build_responses_tool_call_events(response_id, seq, &tc.tool_name, &arguments, &tc.call_id)
+}
 
+/// Build Responses tool-call SSE events. Shared by real tool calls and heartbeat.
+fn build_responses_tool_call_events(
+    response_id: &str,
+    seq: &AtomicU64,
+    tool_name: &str,
+    arguments: &str,
+    call_id: &str,
+) -> Vec<Event> {
+    let item_id = format!("fc_{}", &Uuid::new_v4().to_string().replace("-", "")[..24]);
     let next_seq = || seq.fetch_add(1, Ordering::SeqCst);
 
     let added = json!({
@@ -498,7 +646,7 @@ fn yield_responses_tool_call_events(
             "type": "function_call",
             "id": item_id,
             "call_id": call_id,
-            "name": tc.tool_name,
+            "name": tool_name,
             "arguments": "",
             "status": "in_progress",
         }
@@ -517,7 +665,7 @@ fn yield_responses_tool_call_events(
         "sequence_number": next_seq(),
         "item_id": item_id,
         "output_index": 0,
-        "name": tc.tool_name,
+        "name": tool_name,
         "arguments": arguments,
     });
 
@@ -529,7 +677,7 @@ fn yield_responses_tool_call_events(
             "type": "function_call",
             "id": item_id,
             "call_id": call_id,
-            "name": tc.tool_name,
+            "name": tool_name,
             "arguments": arguments,
             "status": "completed",
         }
@@ -551,7 +699,7 @@ fn yield_responses_tool_call_events(
                 "type": "function_call",
                 "id": item_id,
                 "call_id": call_id,
-                "name": tc.tool_name,
+                "name": tool_name,
                 "arguments": arguments,
                 "status": "completed",
             }]
@@ -663,13 +811,14 @@ async fn handle_openai_responses(
 
     let source = extract_source(&headers);
 
-    // Apply disabled_tools from config
-    {
-        let cfg = state.config_service.get_config().await;
-        for tool in &mut tools {
-            if cfg.disabled_tools.iter().any(|dt| dt.matches(&tool.name)) {
-                tool.enabled = false;
-            }
+    // Apply disabled_tools from config snapshot taken above
+    for tool in &mut tools {
+        if config
+            .disabled_tools
+            .iter()
+            .any(|dt| dt.matches(&tool.name))
+        {
+            tool.enabled = false;
         }
     }
 
@@ -707,21 +856,9 @@ fn responses_sse_response(
     ai_sessions: AiSessionManager,
     session_id: String,
 ) -> axum::response::Response {
-    let session_id_header = session_id.clone();
-    let response_id = format!(
-        "resp_{}",
-        &Uuid::new_v4().to_string().replace('-', "")[..24]
-    );
-    let (tx, rx) = mpsc::channel::<Event>(16);
-
+    let (sid_hdr, response_id, tx, rx) = build_sse_response(&session_id, "resp_", 24);
     spawn_responses_pump(ai_sessions, session_id, response_id, tx);
-
-    let stream = ReceiverStream::new(rx).map(Ok::<Event, Infallible>);
-    let mut resp = Sse::new(stream).into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&session_id_header) {
-        resp.headers_mut().insert("X-Session-Id", v);
-    }
-    resp
+    sse_response_from_parts(sid_hdr, rx)
 }
 
 fn spawn_responses_pump(
@@ -746,7 +883,7 @@ async fn run_responses_pump(
     response_id: &str,
     tx: &mpsc::Sender<Event>,
 ) -> Result<(), ()> {
-    let seq = Arc::new(AtomicU64::new(0));
+    let seq = AtomicU64::new(0);
 
     // Send the protocol-required preamble events.
     let created_envelope = json!({
@@ -787,122 +924,91 @@ async fn run_responses_pump(
 
     let dur = Duration::from_secs(SSE_HEARTBEAT_INTERVAL_SECS);
     let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + dur, dur);
-    tokio::select! {
-        biased;
-        call = ai_sessions.wait_for_pending_call(session_id) => {
-            match call {
-                Some(tc) => {
-                    for ev in yield_responses_tool_call_events(response_id, &seq, &tc) {
+    loop {
+        tokio::select! {
+            biased;
+            call = ai_sessions.wait_for_pending_call(session_id) => {
+                match call {
+                    Some(tc) => {
+                        for ev in yield_responses_tool_call_events(response_id, &seq, &tc) {
+                            tx.send(ev).await.map_err(|_| ())?;
+                        }
+                        return Ok(());
+                    }
+                    None => return Ok(()),
+                }
+            }
+            _ = heartbeat.tick() => {
+                if ai_sessions.tool_ping_enabled(session_id).await.unwrap_or(true) {
+                    for ev in responses_heartbeat_events(response_id, session_id, &seq) {
                         tx.send(ev).await.map_err(|_| ())?;
                     }
-                    Ok(())
+                    return Ok(());
                 }
-                None => Ok(()),
+                tx.send(openai_sse_ping_event()).await.map_err(|_| ())?;
             }
-        }
-        _ = heartbeat.tick() => {
-            for ev in responses_heartbeat_events(response_id, session_id, &seq) {
-                tx.send(ev).await.map_err(|_| ())?;
-            }
-            Ok(())
         }
     }
 }
 
-fn responses_heartbeat_events(
-    response_id: &str,
-    session_id: &str,
-    seq: &Arc<AtomicU64>,
-) -> Vec<Event> {
-    let next_seq = || seq.fetch_add(1, Ordering::SeqCst);
+fn responses_heartbeat_events(response_id: &str, session_id: &str, seq: &AtomicU64) -> Vec<Event> {
     let ping_name = heartbeat_token(session_id);
     let call_id = format!("{}:{}", session_id, Uuid::new_v4());
-    let item_id = format!("fc_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
-
-    let added = json!({
-        "type": "response.output_item.added",
-        "sequence_number": next_seq(),
-        "output_index": 0,
-        "item": {
-            "type": "function_call",
-            "id": item_id,
-            "call_id": call_id,
-            "name": ping_name,
-            "arguments": "",
-            "status": "in_progress"
-        }
-    });
-    let delta = json!({
-        "type": "response.function_call_arguments.delta",
-        "sequence_number": next_seq(),
-        "item_id": item_id,
-        "output_index": 0,
-        "delta": "{}"
-    });
-    let args_done = json!({
-        "type": "response.function_call_arguments.done",
-        "sequence_number": next_seq(),
-        "item_id": item_id,
-        "output_index": 0,
-        "name": ping_name,
-        "arguments": "{}"
-    });
-    let item_done = json!({
-        "type": "response.output_item.done",
-        "sequence_number": next_seq(),
-        "output_index": 0,
-        "item": {
-            "type": "function_call",
-            "id": item_id,
-            "call_id": call_id,
-            "name": ping_name,
-            "arguments": "{}",
-            "status": "completed"
-        }
-    });
-    let completed = json!({
-        "type": "response.completed",
-        "sequence_number": next_seq(),
-        "response": {
-            "id": response_id,
-            "object": "response",
-            "created_at": chrono::Utc::now().timestamp(),
-            "status": "completed",
-            "model": RESPONSE_MODEL,
-            "parallel_tool_calls": true,
-            "tool_choice": "auto",
-            "tools": [],
-            "output": [{
-                "type": "function_call",
-                "id": item_id,
-                "call_id": call_id,
-                "name": ping_name,
-                "arguments": "{}",
-                "status": "completed"
-            }]
-        }
-    });
-
-    vec![
-        Event::default()
-            .event("response.output_item.added")
-            .data(added.to_string()),
-        Event::default()
-            .event("response.function_call_arguments.delta")
-            .data(delta.to_string()),
-        Event::default()
-            .event("response.function_call_arguments.done")
-            .data(args_done.to_string()),
-        Event::default()
-            .event("response.output_item.done")
-            .data(item_done.to_string()),
-        Event::default()
-            .event("response.completed")
-            .data(completed.to_string()),
-    ]
+    build_responses_tool_call_events(response_id, seq, &ping_name, "{}", &call_id)
 }
 
 // ── Anthropic Messages (SSE streaming) ──
+
+fn count_text_for_tokens(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.chars().count(),
+        Value::Array(items) => items.iter().map(count_text_for_tokens).sum(),
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                return text.chars().count();
+            }
+            map.values().map(count_text_for_tokens).sum()
+        }
+        Value::Null => 0,
+        other => other.to_string().chars().count(),
+    }
+}
+
+fn estimate_anthropic_input_tokens(body: &Value) -> u64 {
+    let mut chars = 0usize;
+    chars += body
+        .get("system")
+        .map(count_text_for_tokens)
+        .unwrap_or_default();
+    chars += body
+        .get("messages")
+        .map(count_text_for_tokens)
+        .unwrap_or_default();
+    chars += body
+        .get("tools")
+        .map(count_text_for_tokens)
+        .unwrap_or_default();
+
+    // Approximate enough for Claude Code preflight checks; this gateway does
+    // not run a tokenizer or an upstream model.
+    (chars / 4).max(1) as u64
+}
+
+async fn handle_anthropic_count_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let config = state.config_service.get_config().await;
+    if !check_anthropic_auth(&headers, &config.ai_adapter) {
+        return unauthorized_response();
+    }
+
+    Json(json!({
+        "input_tokens": estimate_anthropic_input_tokens(&body),
+    }))
+    .into_response()
+}
 
 fn collect_anthropic_tool_results(request: &AnthropicRequest) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -939,7 +1045,7 @@ async fn handle_anthropic_messages(
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     let config = state.config_service.get_config().await;
-    if extract_anthropic_api_key(&headers, &config.ai_adapter).is_empty() {
+    if !check_anthropic_auth(&headers, &config.ai_adapter) {
         return unauthorized_response();
     }
 
@@ -976,13 +1082,14 @@ async fn handle_anthropic_messages(
     let mut tools = extract_anthropic_tools(&request.tools);
     let source = extract_source(&headers);
 
-    // Apply disabled_tools from config
-    {
-        let cfg = state.config_service.get_config().await;
-        for tool in &mut tools {
-            if cfg.disabled_tools.iter().any(|dt| dt.matches(&tool.name)) {
-                tool.enabled = false;
-            }
+    // Apply disabled_tools from config snapshot taken above
+    for tool in &mut tools {
+        if config
+            .disabled_tools
+            .iter()
+            .any(|dt| dt.matches(&tool.name))
+        {
+            tool.enabled = false;
         }
     }
 
@@ -1018,14 +1125,23 @@ async fn handle_anthropic_tool_results(
 
 fn yield_anthropic_tool_call_events(block_index: u64, tc: &PendingToolCall) -> Vec<Event> {
     let arguments_json = arguments_to_json_string(&tc.arguments);
+    build_anthropic_tool_call_events(block_index, &tc.call_id, &tc.tool_name, &arguments_json)
+}
 
+/// Build Anthropic tool-call SSE events. Shared by real tool calls and heartbeat.
+fn build_anthropic_tool_call_events(
+    block_index: u64,
+    call_id: &str,
+    tool_name: &str,
+    arguments_json: &str,
+) -> Vec<Event> {
     let block_start = json!({
         "type": "content_block_start",
         "index": block_index,
         "content_block": {
             "type": "tool_use",
-            "id": tc.call_id,
-            "name": tc.tool_name,
+            "id": call_id,
+            "name": tool_name,
             "input": {}
         }
     });
@@ -1072,18 +1188,9 @@ fn anthropic_sse_response(
     ai_sessions: AiSessionManager,
     session_id: String,
 ) -> axum::response::Response {
-    let session_id_header = session_id.clone();
-    let response_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
-    let (tx, rx) = mpsc::channel::<Event>(16);
-
+    let (sid_hdr, response_id, tx, rx) = build_sse_response(&session_id, "msg_", 24);
     spawn_anthropic_pump(ai_sessions, session_id, response_id, tx);
-
-    let stream = ReceiverStream::new(rx).map(Ok::<Event, Infallible>);
-    let mut resp = Sse::new(stream).into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&session_id_header) {
-        resp.headers_mut().insert("X-Session-Id", v);
-    }
-    resp
+    sse_response_from_parts(sid_hdr, rx)
 }
 
 fn spawn_anthropic_pump(
@@ -1132,70 +1239,228 @@ async fn run_anthropic_pump(
 
     let dur = Duration::from_secs(SSE_HEARTBEAT_INTERVAL_SECS);
     let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + dur, dur);
-    tokio::select! {
-        biased;
-        call = ai_sessions.wait_for_pending_call(session_id) => {
-            match call {
-                Some(tc) => {
-                    for ev in yield_anthropic_tool_call_events(0, &tc) {
+    loop {
+        tokio::select! {
+            biased;
+            call = ai_sessions.wait_for_pending_call(session_id) => {
+                match call {
+                    Some(tc) => {
+                        for ev in yield_anthropic_tool_call_events(0, &tc) {
+                            tx.send(ev).await.map_err(|_| ())?;
+                        }
+                        return Ok(());
+                    }
+                    None => return Ok(()),
+                }
+            }
+            _ = heartbeat.tick() => {
+                if ai_sessions.tool_ping_enabled(session_id).await.unwrap_or(true) {
+                    for ev in anthropic_heartbeat_events(session_id) {
                         tx.send(ev).await.map_err(|_| ())?;
                     }
-                    Ok(())
+                    return Ok(());
                 }
-                None => Ok(()),
+                tx.send(anthropic_sse_ping_event()).await.map_err(|_| ())?;
             }
-        }
-        _ = heartbeat.tick() => {
-            for ev in anthropic_heartbeat_events(session_id) {
-                tx.send(ev).await.map_err(|_| ())?;
-            }
-            Ok(())
         }
     }
+}
+
+fn anthropic_sse_ping_event() -> Event {
+    Event::default()
+        .event("ping")
+        .data(json!({"type": "ping"}).to_string())
 }
 
 fn anthropic_heartbeat_events(session_id: &str) -> Vec<Event> {
     let ping_name = heartbeat_token(session_id);
     let call_id = format!("{}:{}", session_id, Uuid::new_v4());
+    build_anthropic_tool_call_events(0, &call_id, &ping_name, "{}")
+}
 
-    let block_start = json!({
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {
-            "type": "tool_use",
-            "id": call_id,
-            "name": ping_name,
-            "input": {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use chrono::Utc;
+    use gateway_core::{save_config_atomic, ConfigService, GatewayConfig, ProcessManager};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use crate::{SkillsService, SseHub};
+
+    async fn test_router(api_keys: Vec<String>) -> Router {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let path = dir.path().join("config.json");
+        let mut config = GatewayConfig::default();
+        config.security.admin.token = "admin-test-token".to_string();
+        config.ai_adapter.api_keys = api_keys;
+        save_config_atomic(&path, &config).expect("save test config");
+
+        let config_service = ConfigService::from_path(path)
+            .await
+            .expect("load test config");
+        let state = AppState {
+            config_service,
+            process_manager: ProcessManager::new(),
+            started_at: Utc::now(),
+            sse_hub: SseHub::new(),
+            skills: SkillsService::new(),
+            ai_sessions: AiSessionManager::new(),
+        };
+
+        router(state, &config.ai_adapter)
+    }
+
+    async fn json_body(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn get(path: &str, auth_header: (&str, &str)) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(auth_header.0, auth_header.1)
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    fn post_json(path: &str, auth_header: (&str, &str), body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header(auth_header.0, auth_header.1)
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn double_v1_models_returns_same_list() {
+        let app = test_router(vec!["test-key".to_string()]).await;
+
+        let canonical = app
+            .clone()
+            .oneshot(get(
+                "/api/v2/ai/v1/models",
+                ("authorization", "Bearer test-key"),
+            ))
+            .await
+            .expect("canonical response");
+        assert_eq!(canonical.status(), StatusCode::OK);
+        let canonical_body = json_body(canonical).await;
+
+        let compat = app
+            .oneshot(get(
+                "/api/v2/ai/v1/v1/models",
+                ("authorization", "Bearer test-key"),
+            ))
+            .await
+            .expect("compat response");
+        assert_eq!(compat.status(), StatusCode::OK);
+        assert_eq!(json_body(compat).await, canonical_body);
+    }
+
+    #[tokio::test]
+    async fn double_v1_model_retrieve_reuses_model_handler() {
+        let app = test_router(vec!["test-key".to_string()]).await;
+
+        let response = app
+            .oneshot(get(
+                "/api/v2/ai/v1/v1/models/claude-opus-4-7",
+                ("x-api-key", "test-key"),
+            ))
+            .await
+            .expect("model response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["id"], "claude-opus-4-7");
+        assert_eq!(body["type"], "model");
+    }
+
+    #[tokio::test]
+    async fn double_v1_count_tokens_accepts_bearer_and_x_api_key() {
+        let app = test_router(vec!["test-key".to_string()]).await;
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+
+        for auth_header in [
+            ("authorization", "Bearer test-key"),
+            ("x-api-key", "test-key"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post_json(
+                    "/api/v2/ai/v1/v1/messages/count_tokens",
+                    auth_header,
+                    body.clone(),
+                ))
+                .await
+                .expect("count_tokens response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                json_body(response).await["input_tokens"]
+                    .as_u64()
+                    .expect("input token count")
+                    > 0
+            );
         }
-    });
-    let delta = json!({
-        "type": "content_block_delta",
-        "index": 0,
-        "delta": { "type": "input_json_delta", "partial_json": "{}" }
-    });
-    let block_stop = json!({ "type": "content_block_stop", "index": 0 });
-    let msg_delta = json!({
-        "type": "message_delta",
-        "delta": { "stop_reason": "tool_use", "stop_sequence": null },
-        "usage": { "output_tokens": 0 }
-    });
-    let msg_stop = json!({ "type": "message_stop" });
+    }
 
-    vec![
-        Event::default()
-            .event("content_block_start")
-            .data(block_start.to_string()),
-        Event::default()
-            .event("content_block_delta")
-            .data(delta.to_string()),
-        Event::default()
-            .event("content_block_stop")
-            .data(block_stop.to_string()),
-        Event::default()
-            .event("message_delta")
-            .data(msg_delta.to_string()),
-        Event::default()
-            .event("message_stop")
-            .data(msg_stop.to_string()),
-    ]
+    #[tokio::test]
+    async fn double_v1_count_tokens_still_requires_key_when_configured() {
+        let app = test_router(vec!["test-key".to_string()]).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v2/ai/v1/v1/messages/count_tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"messages": []}).to_string()))
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn double_v1_messages_streams_anthropic_message_start() {
+        let app = test_router(vec!["test-key".to_string()]).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v2/ai/v1/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-key")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(
+                json!({
+                    "model": "claude-opus-4-7",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("messages response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let frame = body
+            .frame()
+            .await
+            .expect("first sse frame")
+            .expect("valid sse frame");
+        let data = frame.into_data().expect("sse data frame");
+        let text = String::from_utf8(data.to_vec()).expect("utf8 sse");
+        assert!(text.contains("message_start"));
+    }
 }

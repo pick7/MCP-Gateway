@@ -2196,6 +2196,94 @@ mod tests {
         assert_eq!(closed.structured["reason"], "unknown planningId");
     }
 
+    #[tokio::test]
+    async fn ai_adapter_strips_skill_token_before_forwarding_tool_call() {
+        use crate::ai_adapter::session::{AiProtocol, AiToolDef};
+        use crate::ai_adapter::AiSessionManager;
+
+        let service = SkillsService::new();
+        let config = GatewayConfig::default();
+        let ai_sessions = AiSessionManager::new();
+        let prompt = "Use the hidden token for gateway validation only.";
+        let session = ai_sessions
+            .create_session(
+                AiProtocol::OpenaiChat,
+                prompt.to_string(),
+                vec![AiToolDef {
+                    name: "search".to_string(),
+                    description: "Search".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"}
+                        },
+                        "required": ["query"]
+                    }),
+                    enabled: true,
+                }],
+                "test".to_string(),
+            )
+            .await;
+        let token = ai_adapter_system_prompt_skill_token(prompt);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {
+                    "query": "rust",
+                    "skillToken": token,
+                    "skill_token": "also-private"
+                }
+            }
+        });
+
+        let call_task = tokio::spawn({
+            let service = service.clone();
+            let config = config.clone();
+            let ai_sessions = ai_sessions.clone();
+            let server_name = session.name.clone();
+            async move {
+                service
+                    .handle_ai_adapter_mcp_request(
+                        &config,
+                        request,
+                        None,
+                        &server_name,
+                        &ai_sessions,
+                    )
+                    .await
+            }
+        });
+
+        let pending = tokio::time::timeout(
+            Duration::from_secs(1),
+            ai_sessions.wait_for_pending_call(&session.id),
+        )
+        .await
+        .expect("pending tool call")
+        .expect("session exists");
+        assert_eq!(pending.arguments["query"], "rust");
+        assert!(pending.arguments.get("skillToken").is_none());
+        assert!(pending.arguments.get("skill_token").is_none());
+
+        ai_sessions
+            .resolve_tool_call(
+                &session.id,
+                &pending.call_id,
+                crate::ai_adapter::session::PendingToolResult {
+                    content: "ok".to_string(),
+                    is_error: false,
+                },
+            )
+            .await
+            .expect("resolve pending call");
+
+        let response = call_task.await.expect("tool call task");
+        assert_eq!(response["result"]["isError"], false);
+    }
+
 
     #[tokio::test]
     async fn builtin_tool_all_covers_every_variant() {

@@ -3029,7 +3029,17 @@ function App() {
                         <div className="ai-session-card-main">
                           <div className="ai-session-card-header">
                             <div className="ai-session-card-info">
-                              <span className="ai-session-card-name">{session.displayName}</span>
+                              <div className="ai-session-card-title">
+                                <span className="ai-session-card-name">{session.displayName}</span>
+                                <button
+                                  className="ai-session-rename-action"
+                                  onClick={() => { setRenameSessionId(session.id); setRenameSessionName(session.displayName); }}
+                                  title={t("sessionRename")}
+                                  aria-label={t("sessionRename")}
+                                >
+                                  <Pencil size={12} />
+                                </button>
+                              </div>
                               <span className={`ai-session-card-protocol protocol-${session.protocol}`} title={t("aiAdapterProtocol")}>
                                 {session.protocol === "openai-chat"
                                   ? t("aiAdapterProtocolOpenaiChat")
@@ -3047,13 +3057,6 @@ function App() {
                               </button>
                             </div>
                             <div className="ai-session-card-actions">
-                              <button
-                                className="runtime-line-action"
-                                onClick={() => { setRenameSessionId(session.id); setRenameSessionName(session.displayName); }}
-                                title={t("sessionRename")}
-                              >
-                                <Pencil size={13} />
-                              </button>
                               <button
                                 className="runtime-line-action runtime-line-danger-action"
                                 onClick={async () => {
@@ -3076,6 +3079,25 @@ function App() {
                             <div className="ai-session-card-detail-row">
                               <span className="ai-session-card-detail-label">{t("aiAdapterConnected")}</span>
                               <span className="ai-session-card-detail-value">{formatTime(session.connectedAt)}</span>
+                            </div>
+                            <div className="ai-session-card-detail-row ai-session-card-toggle-row">
+                              <span className="ai-session-card-detail-label">{t("sessionToolPing")}</span>
+                              <span className="ai-session-card-toggle-description">{t("sessionToolPingDesc")}</span>
+                              <button
+                                className={`toggle-btn ${session.toolPingEnabled !== false ? "toggle-on" : "toggle-off"}`}
+                                onClick={async () => {
+                                  const next = !(session.toolPingEnabled !== false);
+                                  try {
+                                    await apiClient.toggleSessionToolPing(session.id, next);
+                                    setAiSessions((prev) => prev.map((s) => s.id === session.id ? { ...s, toolPingEnabled: next } : s));
+                                  } catch (e) {
+                                    setError(String(e));
+                                  }
+                                }}
+                                title={t("sessionToolPingTitle")}
+                                aria-label={t("sessionToolPingEnableLabel")}
+                                aria-pressed={session.toolPingEnabled !== false}
+                              />
                             </div>
                             {session.hasSystemPrompt && (
                               <div className="ai-session-card-detail-row" style={{ alignItems: "center" }}>

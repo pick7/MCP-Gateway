@@ -412,15 +412,7 @@ impl SkillsService {
                 if tool_params.name == "system_prompt" {
                     let session_prompt = ai_sessions.get_effective_system_prompt_by_name(server_name).await;
                     let body = session_prompt.map(|(_, t)| t).unwrap_or_default();
-                    // Compute skillToken as FNV-1a hash of the prompt content (first 6 hex chars)
-                    let skill_token = {
-                        let mut hash = 0xcbf29ce484222325u64;
-                        for byte in body.as_bytes() {
-                            hash ^= u64::from(*byte);
-                            hash = hash.wrapping_mul(0x100000001b3);
-                        }
-                        format!("{hash:016x}").chars().take(6).collect::<String>()
-                    };
+                    let skill_token = ai_adapter_system_prompt_skill_token(&body);
                     let os = std::env::consts::OS;
                     let text = format!("[skillToken]: {skill_token}
 [os]: {os}
@@ -432,16 +424,10 @@ impl SkillsService {
                 // skillToken validation: when system_prompt_tool_enabled is on,
                 // all tools (except system_prompt) must carry a valid skillToken.
                 let session_prompt_info = ai_sessions.get_effective_system_prompt_by_name(server_name).await;
+                let mut strip_private_arguments = false;
                 if let Some((enabled, ref prompt_body)) = session_prompt_info {
                     if enabled {
-                        let expected_token = {
-                            let mut hash = 0xcbf29ce484222325u64;
-                            for byte in prompt_body.as_bytes() {
-                                hash ^= u64::from(*byte);
-                                hash = hash.wrapping_mul(0x100000001b3);
-                            }
-                            format!("{hash:016x}").chars().take(6).collect::<String>()
-                        };
+                        let expected_token = ai_adapter_system_prompt_skill_token(prompt_body);
                         let provided_token = tool_params
                             .arguments
                             .get("skillToken")
@@ -460,6 +446,7 @@ impl SkillsService {
                                 }),
                             );
                         }
+                        strip_private_arguments = true;
                     }
                 }
 
@@ -474,8 +461,13 @@ impl SkillsService {
                 };
 
                 // 将工具调用转发到 AI 会话（MCP → AI 方向）
+                let forwarded_arguments = if strip_private_arguments {
+                    strip_ai_adapter_private_arguments(&tool_params.arguments)
+                } else {
+                    tool_params.arguments.clone()
+                };
                 match ai_sessions
-                    .set_pending_tool_call(&ai_session_id, &tool_params.name, tool_params.arguments.clone())
+                    .set_pending_tool_call(&ai_session_id, &tool_params.name, forwarded_arguments)
                     .await
                 {
                     Ok(pending) => {
@@ -570,4 +562,22 @@ impl SkillsService {
             .await
     }
 
+}
+
+fn ai_adapter_system_prompt_skill_token(prompt_body: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in prompt_body.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}").chars().take(6).collect::<String>()
+}
+
+fn strip_ai_adapter_private_arguments(arguments: &Value) -> Value {
+    let mut cleaned = arguments.clone();
+    if let Some(object) = cleaned.as_object_mut() {
+        object.remove("skillToken");
+        object.remove("skill_token");
+    }
+    cleaned
 }

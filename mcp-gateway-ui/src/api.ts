@@ -249,4 +249,15 @@ export class ApiClient {
       { enabled } as JsonValue,
     );
   }
+
+  async toggleSessionToolPing(
+    sessionId: string,
+    enabled: boolean,
+  ): Promise<JsonValue> {
+    return this.request<JsonValue>(
+      "PUT",
+      `/admin/ai-sessions/${encodeURIComponent(sessionId)}/tool-ping`,
+      { enabled } as JsonValue,
+    );
+  }
 }
