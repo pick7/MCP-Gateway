@@ -104,6 +104,8 @@ This makes it possible to build agent-like workflows on top of normal MCP client
 
 ## AI Adapter (BYOK)
 
+![AI Adapter Interface](./image3.png)
+
 The AI Adapter accepts incoming connections from AI coding tools that support custom API endpoints (OpenAI or Anthropic protocol). When a tool connects, it sends its tool definitions in the request. The gateway extracts those tools, registers them as MCP tools, and exposes them through a dedicated MCP endpoint — so MCP clients can call the tools that the AI tool declared.
 
 How it works:
